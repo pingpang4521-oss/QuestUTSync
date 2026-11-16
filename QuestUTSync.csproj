@@ -3,8 +3,10 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>false</SelfContained>
+    <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
     <AssemblyName>tracker_setup_lite</AssemblyName>
     <RootNamespace>QuestUTSync</RootNamespace>
@@ -20,9 +22,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="lib\openvr_api.dll" Condition="Exists('lib\openvr_api.dll')" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="C:\Program Files\VIVE Hub\VIVE Ultimate Tracker\ViveUTServer\openvr_api.dll"
-          Condition="!Exists('lib\openvr_api.dll') and Exists('C:\Program Files\VIVE Hub\VIVE Ultimate Tracker\ViveUTServer\openvr_api.dll')"
-          CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="lib\openvr_api.dll" Link="openvr_api.dll" Condition="Exists('lib\openvr_api.dll')" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="C:\Program Files\VIVE Hub\VIVE Ultimate Tracker\ViveUTServer\openvr_api.dll"
+             Link="openvr_api.dll"
+             Condition="!Exists('lib\openvr_api.dll') and Exists('C:\Program Files\VIVE Hub\VIVE Ultimate Tracker\ViveUTServer\openvr_api.dll')"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
