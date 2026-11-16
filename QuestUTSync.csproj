@@ -15,7 +15,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>pingpang4521-oss</Authors>
     <Description>Automatic Vive Ultimate Tracker to Meta Quest playspace synchronizer for SteamVR</Description>
     <PackageProjectUrl>https://github.com/pingpang4521-oss/QuestUTSync</PackageProjectUrl>

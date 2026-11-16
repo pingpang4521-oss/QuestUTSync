@@ -121,15 +121,15 @@ internal static class Program
             return false;
         }
 
-        string stagingDir = Path.Combine(Path.GetTempPath(), "QuestUTSync");
-        Directory.CreateDirectory(stagingDir);
-        string stagedExe = Path.Combine(stagingDir, "tracker_setup_lite.exe");
-
-        var srcInfo = new FileInfo(processPath);
-        var dstInfo = new FileInfo(stagedExe);
-        if (!dstInfo.Exists || dstInfo.Length != srcInfo.Length || dstInfo.LastWriteTimeUtc != srcInfo.LastWriteTimeUtc)
+        string? stagedExe = TryStageAliasExecutable(processPath, out string stageError);
+        if (stagedExe == null)
         {
-            File.Copy(processPath, stagedExe, overwrite: true);
+            // Staging must never kill the app: report it and keep running under the current file name.
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[Launcher Warning] Could not stage a copy named tracker_setup_lite.exe: {stageError}");
+            Console.WriteLine("[Launcher Warning] Running unchanged. VIVE Hub only accepts that name, so the sync will likely be ignored.");
+            Console.ResetColor();
+            return false;
         }
 
         var psi = new ProcessStartInfo(stagedExe)
@@ -142,25 +142,110 @@ internal static class Program
         }
         psi.Environment["QUESTUTSYNC_ALIAS_ACTIVE"] = "1";
 
-        using var proc = Process.Start(psi);
+        Process? proc;
+        try
+        {
+            proc = Process.Start(psi);
+        }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[Launcher Warning] Could not start '{stagedExe}': {ex.Message}");
+            Console.ResetColor();
+            return false;
+        }
+
         if (proc == null)
         {
             return false;
         }
 
-        ConsoleCancelEventHandler parentCancel = (_, e) => e.Cancel = true;
-        Console.CancelKeyPress += parentCancel;
-        try
+        using (proc)
         {
-            proc.WaitForExit();
-        }
-        finally
-        {
-            Console.CancelKeyPress -= parentCancel;
+            ConsoleCancelEventHandler parentCancel = (_, e) => e.Cancel = true;
+            Console.CancelKeyPress += parentCancel;
+            try
+            {
+                proc.WaitForExit();
+            }
+            finally
+            {
+                Console.CancelKeyPress -= parentCancel;
+            }
+
+            exitCode = proc.ExitCode;
         }
 
-        exitCode = proc.ExitCode;
         return true;
+    }
+
+    /// <summary>
+    /// Stages this executable as tracker_setup_lite.exe under a folder named after the build itself,
+    /// so a second instance reuses the existing copy instead of overwriting a file that may be running
+    /// (that copy threw an IOException and killed the app at launch). Returns null when staging is not
+    /// possible instead of letting the caller crash.
+    /// </summary>
+    private static string? TryStageAliasExecutable(string sourcePath, out string error)
+    {
+        error = string.Empty;
+        try
+        {
+            var source = new FileInfo(sourcePath);
+            string stageRoot = Path.Combine(Path.GetTempPath(), "QuestUTSync");
+            string stageDir = Path.Combine(stageRoot, $"{source.Length:x}-{source.LastWriteTimeUtc.Ticks:x}");
+            Directory.CreateDirectory(stageDir);
+
+            string target = Path.Combine(stageDir, "tracker_setup_lite.exe");
+            if (!IsSameFile(target, source))
+            {
+                try
+                {
+                    File.Copy(sourcePath, target, overwrite: true);
+                }
+                catch (IOException) when (IsSameFile(target, source))
+                {
+                    // A concurrent launch of the same build staged it first; reuse that copy.
+                }
+            }
+
+            CleanStagingRoot(stageRoot, stageDir);
+            return target;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return null;
+        }
+    }
+
+    private static bool IsSameFile(string path, FileInfo source)
+    {
+        var info = new FileInfo(path);
+        return info.Exists && info.Length == source.Length && info.LastWriteTimeUtc == source.LastWriteTimeUtc;
+    }
+
+    private static void CleanStagingRoot(string stageRoot, string keepDir)
+    {
+        try
+        {
+            // Leftover flat copy from versions before the per-build folders.
+            try { File.Delete(Path.Combine(stageRoot, "tracker_setup_lite.exe")); } catch { /* in use */ }
+
+            foreach (string dir in Directory.EnumerateDirectories(stageRoot))
+            {
+                if (string.Equals(dir.TrimEnd(Path.DirectorySeparatorChar), keepDir.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try { Directory.Delete(dir, recursive: true); }
+                catch { /* another instance is still running from it */ }
+            }
+        }
+        catch
+        {
+            // Best effort only; a full temp folder must not stop a calibration.
+        }
     }
 
     private static void RunCalibrationLoop(OpenVrReader vr, bool runOnce, bool dryRun, float feetBackMeters, CancellationToken ct)
