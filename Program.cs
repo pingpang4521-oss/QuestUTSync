@@ -37,6 +37,11 @@ internal static class Program
             return RunSelfTest();
         }
 
+        if (!dryRun && TryRelaunchWithAllowedPipeName(args, out int relaunchExitCode))
+        {
+            return relaunchExitCode;
+        }
+
         Console.WriteLine("============================================================");
         Console.WriteLine(" QuestUTSync - Automatic Vive Ultimate Tracker Calibration");
         Console.WriteLine(" Process Alias : " + Process.GetCurrentProcess().ProcessName + ".exe");
@@ -74,6 +79,71 @@ internal static class Program
         {
             vr?.Dispose();
         }
+    }
+
+    private static bool TryRelaunchWithAllowedPipeName(string[] args, out int exitCode)
+    {
+        exitCode = 0;
+        if (Environment.GetEnvironmentVariable("QUESTUTSYNC_ALIAS_ACTIVE") == "1")
+        {
+            return false;
+        }
+
+        string? processPath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(processPath))
+        {
+            return false;
+        }
+
+        string fileName = Path.GetFileName(processPath);
+        if (fileName.Equals("tracker_setup_lite.exe", StringComparison.OrdinalIgnoreCase) ||
+            fileName.Equals("tracker_setup.exe", StringComparison.OrdinalIgnoreCase) ||
+            fileName.Equals("vrserver.exe", StringComparison.OrdinalIgnoreCase) ||
+            fileName.Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        string stagingDir = Path.Combine(Path.GetTempPath(), "QuestUTSync");
+        Directory.CreateDirectory(stagingDir);
+        string stagedExe = Path.Combine(stagingDir, "tracker_setup_lite.exe");
+
+        var srcInfo = new FileInfo(processPath);
+        var dstInfo = new FileInfo(stagedExe);
+        if (!dstInfo.Exists || dstInfo.Length != srcInfo.Length || dstInfo.LastWriteTimeUtc != srcInfo.LastWriteTimeUtc)
+        {
+            File.Copy(processPath, stagedExe, overwrite: true);
+        }
+
+        var psi = new ProcessStartInfo(stagedExe)
+        {
+            UseShellExecute = false
+        };
+        foreach (string arg in args)
+        {
+            psi.ArgumentList.Add(arg);
+        }
+        psi.Environment["QUESTUTSYNC_ALIAS_ACTIVE"] = "1";
+
+        using var proc = Process.Start(psi);
+        if (proc == null)
+        {
+            return false;
+        }
+
+        ConsoleCancelEventHandler parentCancel = (_, e) => e.Cancel = true;
+        Console.CancelKeyPress += parentCancel;
+        try
+        {
+            proc.WaitForExit();
+        }
+        finally
+        {
+            Console.CancelKeyPress -= parentCancel;
+        }
+
+        exitCode = proc.ExitCode;
+        return true;
     }
 
     private static void RunCalibrationLoop(OpenVrReader vr, bool runOnce, bool dryRun, CancellationToken ct)
