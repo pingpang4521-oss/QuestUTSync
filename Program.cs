@@ -53,7 +53,21 @@ internal static class Program
 
         try
         {
-            RunCalibrationLoop(vr!, runOnce, dryRun);
+            using var cts = new CancellationTokenSource();
+            ConsoleCancelEventHandler cancelHandler = (_, e) =>
+            {
+                e.Cancel = true;
+                cts.Cancel();
+            };
+            Console.CancelKeyPress += cancelHandler;
+            try
+            {
+                RunCalibrationLoop(vr!, runOnce, dryRun, cts.Token);
+            }
+            finally
+            {
+                Console.CancelKeyPress -= cancelHandler;
+            }
             return 0;
         }
         finally
@@ -62,28 +76,34 @@ internal static class Program
         }
     }
 
-    private static void RunCalibrationLoop(OpenVrReader vr, bool runOnce, bool dryRun)
+    private static void RunCalibrationLoop(OpenVrReader vr, bool runOnce, bool dryRun, CancellationToken ct)
     {
         Console.WriteLine("\n[Ready] How to sync at any time in VR:");
         Console.WriteLine("  1. Stand comfortably & look straight ahead for 1 second (1st beep = Armed).");
         Console.WriteLine("  2. Lift your LEFT leg up ~10+ cm while keeping your right foot planted (double beep = Synced!).\n");
 
         const int PollHz = 30;
+        const int ActiveSleepMs = 1000 / PollHz;
+        const int IdleSleepMs = 200;
         const float StillVelocityThreshold = 0.04f; // 4 cm/s max velocity while standing still
         const float StillAngularThreshold = 0.12f;  // ~7 deg/s max HMD angular velocity while standing still
         const float StillDurationRequired = 1.0f;   // 1.0s of stillness to arm
         const float ArmedTimeoutSeconds = 4.5f;     // window to lift left foot after arming
+        const float PoseDropGraceSeconds = 0.30f;   // tolerate brief optical tracking drops
         const float LiftHeightThreshold = 0.10f;    // 10 cm vertical rise on lifted left foot
         const float PlantedMaxMove = 0.035f;        // 3.5 cm max movement on planted right foot
         const float HeadMaxMoveDuringLift = 0.08f;  // 8 cm max head movement during leg lift
+        const float WaistMaxDropDuringLift = 0.10f; // 10 cm max crouch/sit drop during leg lift
 
         Vector3 prevHmdPos = default;
         Vector3[] prevTrkPos = new Vector3[3];
         bool hasPrev = false;
         long lastTick = Stopwatch.GetTimestamp();
+        long lastValidPoseTick = lastTick;
 
         float stillTimer = 0f;
         int stillSampleCount = 0;
+        int stillJitterFrames = 0;
         Vector3 sumHmdPos = default;
         Vector3 sumHmdForward = default;
         Vector3[] sumTrkPos = new Vector3[3];
@@ -92,35 +112,59 @@ internal static class Program
         float armedTimer = 0f;
         DateTime cooldownUntil = DateTime.MinValue;
 
+        CalibrationTransform? lastSentCal = null;
+        DateTime lastCalFileUtc = DateTime.MinValue;
+
         StandingSnapshot baseline = new() { TrackerPos = new Vector3[3] };
         int lastDeviceCountLog = -1;
+        int nextSleepMs = 0;
 
-        while (true)
+        while (!ct.IsCancellationRequested)
         {
-            Thread.Sleep(1000 / PollHz);
+            if (nextSleepMs > 0 && ct.WaitHandle.WaitOne(nextSleepMs))
+                break;
+            nextSleepMs = ActiveSleepMs;
 
             if (DateTime.UtcNow < cooldownUntil)
             {
                 hasPrev = false;
                 stillTimer = 0f;
                 stillSampleCount = 0;
+                stillJitterFrames = 0;
                 isArmed = false;
+                nextSleepMs = IdleSleepMs;
                 continue;
             }
 
+            long nowTick = Stopwatch.GetTimestamp();
             if (!vr.TryGetSnapshot(out var frame))
             {
-                if (lastDeviceCountLog != frame.TrackerCount)
+                bool allConnected = frame.HasConnectedHmd && frame.ConnectedTrackerCount == 3;
+                bool withinGrace = allConnected &&
+                                   (isArmed || stillTimer > 0f) &&
+                                   Stopwatch.GetElapsedTime(lastValidPoseTick, nowTick).TotalSeconds <= PoseDropGraceSeconds;
+
+                if (withinGrace)
                 {
-                    Console.WriteLine($"[Waiting] Found HMD={frame.HasHmd}, Ultimate Trackers={frame.TrackerCount}/3...");
-                    lastDeviceCountLog = frame.TrackerCount;
+                    hasPrev = false;
+                    continue;
+                }
+
+                if (lastDeviceCountLog != frame.ConnectedTrackerCount)
+                {
+                    Console.WriteLine($"[Waiting] Found HMD={frame.HasConnectedHmd}, Ultimate Trackers={frame.ConnectedTrackerCount}/3...");
+                    lastDeviceCountLog = frame.ConnectedTrackerCount;
                 }
                 hasPrev = false;
                 stillTimer = 0f;
                 stillSampleCount = 0;
+                stillJitterFrames = 0;
                 isArmed = false;
+                nextSleepMs = IdleSleepMs;
                 continue;
             }
+
+            lastValidPoseTick = nowTick;
 
             if (lastDeviceCountLog != 3)
             {
@@ -130,7 +174,6 @@ internal static class Program
                 lastDeviceCountLog = 3;
             }
 
-            long nowTick = Stopwatch.GetTimestamp();
             float dt = Math.Clamp((float)Stopwatch.GetElapsedTime(lastTick, nowTick).TotalSeconds, 0.001f, 0.25f);
             lastTick = nowTick;
 
@@ -160,10 +203,13 @@ internal static class Program
 
             if (!isArmed)
             {
-                if (hmdSpeed < StillVelocityThreshold &&
+                bool isStillPose =
+                    hmdSpeed < StillVelocityThreshold &&
                     frame.HmdAngularSpeed < StillAngularThreshold &&
                     maxTrkSpeed < StillVelocityThreshold &&
-                    LegLiftSolver.TryClassifyStandingTrackers(frame.TrackerPos, out int waistIdx, out int footAIdx, out int footBIdx))
+                    LegLiftSolver.TryClassifyStandingTrackers(frame.TrackerPos, out int waistIdx, out int footAIdx, out int footBIdx);
+
+                if (isStillPose)
                 {
                     if (stillSampleCount == 0)
                     {
@@ -172,6 +218,7 @@ internal static class Program
                         Array.Clear(sumTrkPos, 0, 3);
                     }
 
+                    stillJitterFrames = 0;
                     stillTimer += dt;
                     stillSampleCount++;
                     sumHmdPos += frame.HmdPos;
@@ -186,7 +233,12 @@ internal static class Program
 
                         for (int i = 0; i < 3; i++) baseline.TrackerPos[i] = sumTrkPos[i] * invN;
 
-                        LegLiftSolver.TryClassifyStandingTrackers(baseline.TrackerPos, out waistIdx, out footAIdx, out footBIdx);
+                        if (!LegLiftSolver.TryClassifyStandingTrackers(baseline.TrackerPos, out waistIdx, out footAIdx, out footBIdx))
+                        {
+                            stillTimer = 0f;
+                            stillSampleCount = 0;
+                            continue;
+                        }
 
                         baseline.HmdPos = sumHmdPos * invN;
                         baseline.HmdForwardFlat = avgFwd;
@@ -198,6 +250,7 @@ internal static class Program
                         armedTimer = 0f;
                         stillTimer = 0f;
                         stillSampleCount = 0;
+                        stillJitterFrames = 0;
                         Console.ForegroundColor = ConsoleColor.Cyan;
                         Console.WriteLine("[Armed] Standing baseline locked! Lift your LEFT leg up (>10 cm) now...");
                         Console.ResetColor();
@@ -206,8 +259,19 @@ internal static class Program
                 }
                 else
                 {
-                    stillTimer = 0f;
-                    stillSampleCount = 0;
+                    bool mildJitter =
+                        stillSampleCount > 0 &&
+                        ++stillJitterFrames <= 2 &&
+                        hmdSpeed < StillVelocityThreshold * 2.5f &&
+                        frame.HmdAngularSpeed < StillAngularThreshold * 2.5f &&
+                        maxTrkSpeed < StillVelocityThreshold * 2.5f;
+
+                    if (!mildJitter)
+                    {
+                        stillTimer = 0f;
+                        stillSampleCount = 0;
+                        stillJitterFrames = 0;
+                    }
                 }
             }
             else
@@ -223,9 +287,10 @@ internal static class Program
                 float hmdDrift = Vector2.Distance(
                     new Vector2(frame.HmdPos.X, frame.HmdPos.Z),
                     new Vector2(baseline.HmdPos.X, baseline.HmdPos.Z));
-                if (hmdDrift > HeadMaxMoveDuringLift)
+                float waistDrop = baseline.TrackerPos[baseline.WaistIdx].Y - frame.TrackerPos[baseline.WaistIdx].Y;
+                if (hmdDrift > HeadMaxMoveDuringLift || waistDrop > WaistMaxDropDuringLift)
                 {
-                    Console.WriteLine("[Reset] Head moved during leg-lift window. Stand still to re-arm.");
+                    Console.WriteLine("[Reset] Body moved/crouched during leg-lift window. Stand still to re-arm.");
                     isArmed = false;
                     continue;
                 }
@@ -261,7 +326,13 @@ internal static class Program
                                       $"Right Foot = {frame.TrackerSerials[plantedIdx]}, Waist = {frame.TrackerSerials[baseline.WaistIdx]}");
                     Console.ResetColor();
 
-                    var currentCal = VivePipeClient.ReadCurrentCalibration(DefaultViveCalibPath);
+                    DateTime diskUtc = File.Exists(DefaultViveCalibPath)
+                        ? File.GetLastWriteTimeUtc(DefaultViveCalibPath)
+                        : DateTime.MinValue;
+                    var currentCal = (lastSentCal.HasValue && diskUtc == lastCalFileUtc)
+                        ? lastSentCal.Value
+                        : VivePipeClient.ReadCurrentCalibration(DefaultViveCalibPath);
+
                     var delta = LegLiftSolver.SolveDeltaTransform(
                         baseline.HmdPos,
                         baseline.HmdForwardFlat,
@@ -284,6 +355,11 @@ internal static class Program
 
                         if (VivePipeClient.TrySendCalibration(PipeName, newCal, out string pipeMsg))
                         {
+                            lastSentCal = newCal;
+                            lastCalFileUtc = File.Exists(DefaultViveCalibPath)
+                                ? File.GetLastWriteTimeUtc(DefaultViveCalibPath)
+                                : DateTime.MinValue;
+
                             Console.ForegroundColor = ConsoleColor.Green;
                             Console.WriteLine($"[Synced!] {pipeMsg}");
                             Console.ResetColor();
@@ -304,6 +380,7 @@ internal static class Program
 
                     isArmed = false;
                     cooldownUntil = DateTime.UtcNow.AddSeconds(8);
+                    nextSleepMs = IdleSleepMs;
                     Console.WriteLine("[Cooldown] Sync complete. Pausing detector for 8 seconds...\n");
                 }
             }
@@ -384,7 +461,10 @@ internal static class Program
         bool classified = LegLiftSolver.TryClassifyStandingTrackers(
             new[] { steamVrRight, steamVrWaist, steamVrLeft },
             out int wIdx, out int fA, out int fB);
-        Debug.Assert(classified && wIdx == 1, "Waist must be classified as index 1 (highest Y)");
+        if (!classified || wIdx != 1)
+        {
+            throw new Exception("Waist must be classified as index 1 (highest Y)");
+        }
 
         var delta = LegLiftSolver.SolveDeltaTransform(hmdPos, hmdForward, steamVrWaist, steamVrLeft, steamVrRight);
         var composed = LegLiftSolver.ComposeCalibration(existingCal, delta);
@@ -399,6 +479,23 @@ internal static class Program
             throw new Exception($"Solver error too large: leftErr={leftErr}, rightErr={rightErr}");
         }
         Console.WriteLine($"  [PASS] 4-DOF Leg-Lift solver recovered exact pose (residual error = {MathF.Max(leftErr, rightErr) * 1000f:F4} mm)");
+
+        // 1b. Verify ComposeCalibration preserves pitch/roll tilt present in Calibration.json
+        var tiltedExisting = new CalibrationTransform(
+            new Vector3(0.3f, 0.1f, -0.2f),
+            Quaternion.CreateFromYawPitchRoll(0.4f, 0.05f, -0.04f),
+            1.0f);
+        Vector3 tiltedRawLeft = Vector3.Transform(steamVrLeft - tiltedExisting.Position, Quaternion.Inverse(tiltedExisting.Rotation));
+        Vector3 tiltedRawRight = Vector3.Transform(steamVrRight - tiltedExisting.Position, Quaternion.Inverse(tiltedExisting.Rotation));
+        var composedTilted = LegLiftSolver.ComposeCalibration(tiltedExisting, delta);
+        float tiltedErr = MathF.Max(
+            Vector3.Distance(Vector3.Transform(tiltedRawLeft, composedTilted.Rotation) + composedTilted.Position, trueLeftFoot),
+            Vector3.Distance(Vector3.Transform(tiltedRawRight, composedTilted.Rotation) + composedTilted.Position, trueRightFoot));
+        if (tiltedErr > 1e-4f)
+        {
+            throw new Exception($"Tilted composition error too large: {tiltedErr}");
+        }
+        Console.WriteLine($"  [PASS] 3D quaternion composition preserves existing tilt (residual error = {tiltedErr * 1000f:F4} mm)");
 
         // 2. Test 52-byte binary packet layout for ViveTrackerServer.exe cmd 0x1F
         byte[] pkt = VivePipeClient.BuildSubmitTransformPacket(composed, 1234, 5678);
@@ -503,10 +600,6 @@ internal static class LegLiftSolver
     {
         Quaternion dR = delta.Rotation;
         Quaternion newRot = Quaternion.Normalize(Quaternion.Multiply(dR, current.Rotation));
-
-        newRot = new Quaternion(0f, newRot.Y, 0f, newRot.W);
-        newRot = Quaternion.Normalize(newRot);
-
         Vector3 newPos = Vector3.Transform(current.Position, dR) + delta.Translation;
         return new CalibrationTransform(newPos, newRot, current.Scale > 0f ? current.Scale : 1.0f);
     }
@@ -615,15 +708,30 @@ internal static class VivePipeClient
                 using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
                 pipe.Connect(800);
 
-                pipe.Write(startPkt, 0, startPkt.Length);
-                pipe.Flush();
-                _ = pipe.ReadAsync(ackBuf, 0, ackBuf.Length).Wait(120);
+                pipe.WriteAsync(startPkt).AsTask().GetAwaiter().GetResult();
+                pipe.FlushAsync().GetAwaiter().GetResult();
+                _ = ReadWithTimeout(pipe, ackBuf, 120);
 
-                pipe.Write(submitPkt, 0, submitPkt.Length);
-                pipe.Flush();
-                var readTask = pipe.ReadAsync(ackBuf, 0, ackBuf.Length);
-                bool gotAck = readTask.Wait(250) && readTask.Result >= 8 &&
-                              BinaryPrimitives.ReadUInt32LittleEndian(ackBuf.AsSpan(4, 4)) == CmdSubmitSpaceCalibrationTransform;
+                pipe.WriteAsync(submitPkt).AsTask().GetAwaiter().GetResult();
+                pipe.FlushAsync().GetAwaiter().GetResult();
+
+                bool gotAck = false;
+                long deadline = Environment.TickCount64 + 300;
+                while (true)
+                {
+                    int remaining = (int)(deadline - Environment.TickCount64);
+                    if (remaining <= 0) break;
+
+                    int bytesRead = ReadWithTimeout(pipe, ackBuf, remaining);
+                    if (bytesRead <= 0) break;
+
+                    if (bytesRead >= 8 &&
+                        BinaryPrimitives.ReadUInt32LittleEndian(ackBuf.AsSpan(4, 4)) == CmdSubmitSpaceCalibrationTransform)
+                    {
+                        gotAck = true;
+                        break;
+                    }
+                }
 
                 statusMessage = gotAck
                     ? "ViveTrackerServer ACKed 52-byte Submit_Space_Calibration_Transform (0x1F)."
@@ -637,13 +745,29 @@ internal static class VivePipeClient
             }
         }
 
-        statusMessage = $"Failed to send to \\\\.\\pipe\\{pipeName}: {lastErr?.Message}";
+        statusMessage = $"Failed to send to \\\\.\\pipe\\{pipeName} ({lastErr?.Message}) — make sure VIVE Hub / ViveTrackerServer.exe is running.";
         return false;
+    }
+
+    private static int ReadWithTimeout(NamedPipeClientStream pipe, byte[] buffer, int timeoutMs)
+    {
+        if (timeoutMs <= 0) return 0;
+        using var cts = new CancellationTokenSource(timeoutMs);
+        try
+        {
+            return pipe.ReadAsync(buffer.AsMemory(), cts.Token).AsTask().GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            return 0;
+        }
     }
 }
 
 internal struct FrameSnapshot
 {
+    public bool HasConnectedHmd;
+    public int ConnectedTrackerCount;
     public bool HasHmd;
     public string HmdSerial;
     public Vector3 HmdPos;
@@ -663,9 +787,10 @@ internal sealed unsafe class OpenVrReader : IDisposable
     private const int TrackingUniverseStanding = 1;
     private const int TrackedDeviceClassHmd = 1;
     private const int TrackedDeviceClassGenericTracker = 3;
+    private const int PropModelNumberString = 1001;
     private const int PropSerialNumberString = 1002;
-    private const int PropControllerTypeString = 1031;
-    private const int PropRegisteredDeviceTypeString = 1037;
+    private const int PropRegisteredDeviceTypeString = 1036;
+    private const int PropControllerTypeString = 7000;
 
     [DllImport("openvr_api.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     private static extern uint VR_InitInternal2(ref int peError, int eApplicationType, string? pStartupInfo);
@@ -717,7 +842,7 @@ internal sealed unsafe class OpenVrReader : IDisposable
     private delegate uint GetStringTrackedDevicePropertyDelegate(
         uint unDeviceIndex,
         int prop,
-        StringBuilder pchValue,
+        byte* pchValue,
         uint unBufferSize,
         ref int pError);
 
@@ -743,7 +868,6 @@ internal sealed unsafe class OpenVrReader : IDisposable
     private readonly SetSettingsStringDelegate? _setSettingsString;
     private readonly TrackedDevicePose_t[] _poseBuffer = new TrackedDevicePose_t[MaxTrackedDevices];
     private readonly CachedDevice[] _deviceCache = new CachedDevice[MaxTrackedDevices];
-    private readonly StringBuilder _propSb = new(128);
     private readonly string[] _snapshotSerials = new string[3];
     private readonly string[] _snapshotPaths = new string[3];
     private readonly Vector3[] _snapshotPos = new Vector3[3];
@@ -819,16 +943,36 @@ internal sealed unsafe class OpenVrReader : IDisposable
 
     public void AssignTrackerRoles(string waistPath, string leftFootPath, string rightFootPath)
     {
-        if (_setSettingsString == null) return;
-        int err = 0;
-        if (!string.IsNullOrEmpty(waistPath))
-            _setSettingsString("trackers", waistPath, "TrackerRole_Waist", ref err);
-        if (!string.IsNullOrEmpty(leftFootPath))
-            _setSettingsString("trackers", leftFootPath, "TrackerRole_LeftFoot", ref err);
-        if (!string.IsNullOrEmpty(rightFootPath))
-            _setSettingsString("trackers", rightFootPath, "TrackerRole_RightFoot", ref err);
+        if (_setSettingsString == null)
+        {
+            Console.WriteLine("[SteamVR Roles Warning] IVRSettings_003 unavailable; skipping role assignment.");
+            return;
+        }
 
-        Console.WriteLine($"[SteamVR Roles] Assigned Waist={waistPath}, LeftFoot={leftFootPath}, RightFoot={rightFootPath}");
+        bool ok = true;
+        ok &= SetTrackerRole(waistPath, "TrackerRole_Waist");
+        ok &= SetTrackerRole(leftFootPath, "TrackerRole_LeftFoot");
+        ok &= SetTrackerRole(rightFootPath, "TrackerRole_RightFoot");
+
+        if (ok)
+        {
+            Console.WriteLine($"[SteamVR Roles] Assigned Waist={waistPath}, LeftFoot={leftFootPath}, RightFoot={rightFootPath}");
+        }
+    }
+
+    private bool SetTrackerRole(string path, string role)
+    {
+        if (string.IsNullOrEmpty(path) || _setSettingsString == null) return true;
+        int err = 0;
+        _setSettingsString("trackers", path, role, ref err);
+        if (err != 0)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[SteamVR Roles Warning] Failed setting {path} -> {role} (EVRSettingsError={err})");
+            Console.ResetColor();
+            return false;
+        }
+        return true;
     }
 
     public bool TryGetSnapshot(out FrameSnapshot snapshot)
@@ -854,8 +998,6 @@ internal sealed unsafe class OpenVrReader : IDisposable
                 continue;
             }
 
-            if (!pose.bPoseIsValid) continue;
-
             if (!cached.IsEvaluated)
             {
                 int devClass = _getDeviceClass(i);
@@ -867,14 +1009,16 @@ internal sealed unsafe class OpenVrReader : IDisposable
                 if (devClass == TrackedDeviceClassGenericTracker)
                 {
                     string ctrlType = GetStringProperty(i, PropControllerTypeString);
+                    string regPath = GetStringProperty(i, PropRegisteredDeviceTypeString);
                     isUt =
                         serial.StartsWith("48-A", StringComparison.OrdinalIgnoreCase) ||
                         serial.StartsWith("43A", StringComparison.OrdinalIgnoreCase) ||
-                        ctrlType.Contains("ultimate", StringComparison.OrdinalIgnoreCase);
+                        ctrlType.Contains("ultimate", StringComparison.OrdinalIgnoreCase) ||
+                        regPath.Contains("ultimate", StringComparison.OrdinalIgnoreCase) ||
+                        GetStringProperty(i, PropModelNumberString).Contains("ultimate", StringComparison.OrdinalIgnoreCase);
 
                     if (isUt)
                     {
-                        string regPath = GetStringProperty(i, PropRegisteredDeviceTypeString);
                         devPath = !string.IsNullOrEmpty(regPath)
                             ? (regPath.StartsWith('/') ? regPath : "/devices/" + regPath)
                             : $"/devices/vive_ultimate_tracker/{serial}";
@@ -890,6 +1034,11 @@ internal sealed unsafe class OpenVrReader : IDisposable
                     DevicePath = devPath
                 };
             }
+
+            if (cached.IsHmd) snapshot.HasConnectedHmd = true;
+            else if (cached.IsUltimateTracker && snapshot.ConnectedTrackerCount < 3) snapshot.ConnectedTrackerCount++;
+
+            if (!pose.bPoseIsValid) continue;
 
             if (cached.IsHmd && !snapshot.HasHmd)
             {
@@ -923,10 +1072,31 @@ internal sealed unsafe class OpenVrReader : IDisposable
 
     private string GetStringProperty(uint deviceIdx, int prop)
     {
-        _propSb.Clear();
-        int err = 0;
-        uint len = _getStringProp(deviceIdx, prop, _propSb, (uint)_propSb.Capacity, ref err);
-        return err == 0 && len > 0 ? _propSb.ToString() : string.Empty;
+        const int TrackedPropBufferTooSmall = 5;
+        Span<byte> buf = stackalloc byte[256];
+        fixed (byte* ptr = buf)
+        {
+            int err = 0;
+            uint len = _getStringProp(deviceIdx, prop, ptr, (uint)buf.Length, ref err);
+            if (err == TrackedPropBufferTooSmall && len > 1 && len <= 4096)
+            {
+                byte[] rented = new byte[len];
+                fixed (byte* ptrLarge = rented)
+                {
+                    err = 0;
+                    len = _getStringProp(deviceIdx, prop, ptrLarge, len, ref err);
+                    if (err != 0 || len <= 1) return string.Empty;
+                    var sliceLarge = rented.AsSpan(0, (int)len - 1);
+                    int nulLarge = sliceLarge.IndexOf((byte)0);
+                    return Encoding.UTF8.GetString(nulLarge >= 0 ? sliceLarge[..nulLarge] : sliceLarge);
+                }
+            }
+
+            if (err != 0 || len <= 1) return string.Empty;
+            var slice = buf[..Math.Min((int)len - 1, buf.Length)];
+            int nul = slice.IndexOf((byte)0);
+            return Encoding.UTF8.GetString(nul >= 0 ? slice[..nul] : slice);
+        }
     }
 
     public void Dispose()
