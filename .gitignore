@@ -21,7 +21,3 @@ ehthumbs.db
 [Dd]esktop.ini
 $RECYCLE.BIN/
 .DS_Store
-
-# Preserve native dependencies in lib
-!lib/
-!lib/openvr_api.dll

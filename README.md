@@ -17,9 +17,8 @@ Automated, hands-free playspace synchronization between HTC Vive Ultimate Tracke
 ## Requirements
 
 1. **VR Headset:** Meta Quest (Pro, 3, 3S, 2) connected to PC via Steam Link, Virtual Desktop, or AirLink.
-2. **Trackers:** 3x HTC Vive Ultimate Trackers paired and tracking in official VIVE Hub software.
+2. **Trackers:** Exactly 3 HTC Vive Ultimate Trackers (waist + both feet) paired and tracking in official VIVE Hub software. Turn any extra Ultimate Trackers off while syncing.
 3. **SteamVR:** Running on Windows 10/11 x64.
-4. **Runtime:** .NET 8 runtime (if building from source).
 
 ---
 
@@ -33,6 +32,10 @@ Automated, hands-free playspace synchronization between HTC Vive Ultimate Tracke
    - **Step 2:** Lift your **left foot** upward by at least 10 cm (marching motion). You will hear a double audio tone indicating the playspace is **Synced**.
 5. All three trackers will snap to your body in SteamVR and in VRChat.
 
+> **Important:** It must be the **left** foot. The trackers alone cannot tell left from right, so lifting the right foot is accepted but rotates the result by 180°.
+>
+> A long low tone instead of the double tone means the calibration was sent but VIVE Hub did not confirm it. Check the console, and make sure VIVE Hub is running.
+
 ---
 
 ## Command-Line Options
@@ -41,6 +44,7 @@ Automated, hands-free playspace synchronization between HTC Vive Ultimate Tracke
 |---|---|
 | `--once` | Perform one calibration cycle and terminate. |
 | `--dry-run` | Calculate calibration transformation without writing to the named pipe. |
+| `--feet-back-cm <n>` | Place your feet `n` cm behind the headset (default `0`, range −30 to 30). Use this if your trackers consistently land in front of or behind your body. |
 | `--selftest` | Execute internal solver verification tests. |
 | `--help`, `-h` | Display help screen. |
 
@@ -75,3 +79,5 @@ dotnet publish -c Release -o dist QuestUTSync.csproj
 ## License
 
 Distributed under the [MIT License](LICENSE).
+
+`lib/openvr_api.dll` is Valve's OpenVR runtime library, redistributed under the BSD 3-Clause license (see [lib/openvr_api.LICENSE.txt](lib/openvr_api.LICENSE.txt)).

@@ -5,6 +5,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
@@ -22,11 +23,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="lib\openvr_api.dll" Link="openvr_api.dll" Condition="Exists('lib\openvr_api.dll')" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    <Content Include="C:\Program Files\VIVE Hub\VIVE Ultimate Tracker\ViveUTServer\openvr_api.dll"
-             Link="openvr_api.dll"
-             Condition="!Exists('lib\openvr_api.dll') and Exists('C:\Program Files\VIVE Hub\VIVE Ultimate Tracker\ViveUTServer\openvr_api.dll')"
-             CopyToOutputDirectory="PreserveNewest"
-             CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="lib\openvr_api.dll" Link="openvr_api.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

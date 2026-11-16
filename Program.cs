@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Pipes;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -18,19 +19,31 @@ internal static class Program
     public static int Main(string[] args)
     {
         Console.Title = "QuestUTSync (tracker_setup_lite pipe alias)";
-        bool showHelp = args.Contains("--help", StringComparer.OrdinalIgnoreCase) ||
-                        args.Contains("-h", StringComparer.OrdinalIgnoreCase) ||
-                        args.Contains("/?", StringComparer.OrdinalIgnoreCase) ||
-                        args.Contains("-?");
-        if (showHelp)
+        bool runOnce = false, selfTest = false, dryRun = false;
+        float feetBackMeters = 0f;
+        for (int i = 0; i < args.Length; i++)
         {
-            PrintHelp();
-            return 0;
+            switch (args[i].ToLowerInvariant())
+            {
+                case "--help": case "-h": case "/?": case "-?":
+                    PrintHelp();
+                    return 0;
+                case "--once": runOnce = true; break;
+                case "--selftest": selfTest = true; break;
+                case "--dry-run": dryRun = true; break;
+                case "--feet-back-cm" when i + 1 < args.Length &&
+                                          float.TryParse(args[i + 1], NumberStyles.Float, CultureInfo.InvariantCulture, out float cm) &&
+                                          MathF.Abs(cm) <= 30f:
+                    feetBackMeters = cm / 100f;
+                    i++;
+                    break;
+                default:
+                    // Never ignore unknown args: a typo like "--dryrun" would otherwise write to VIVE Hub for real.
+                    Console.Error.WriteLine($"Unknown or invalid argument: {args[i]}\n");
+                    PrintHelp();
+                    return 2;
+            }
         }
-
-        bool runOnce = args.Contains("--once", StringComparer.OrdinalIgnoreCase);
-        bool selfTest = args.Contains("--selftest", StringComparer.OrdinalIgnoreCase);
-        bool dryRun = args.Contains("--dry-run", StringComparer.OrdinalIgnoreCase);
 
         if (selfTest)
         {
@@ -46,6 +59,10 @@ internal static class Program
         Console.WriteLine(" QuestUTSync - Automatic Vive Ultimate Tracker Calibration");
         Console.WriteLine(" Process Alias : " + Process.GetCurrentProcess().ProcessName + ".exe");
         Console.WriteLine("============================================================");
+        if (feetBackMeters != 0f)
+        {
+            Console.WriteLine($"[Config] Feet placed {feetBackMeters * 100f:F1} cm behind the headset.");
+        }
 
         if (!OpenVrReader.TryInitialize(out var vr, out string vrErr))
         {
@@ -67,7 +84,7 @@ internal static class Program
             Console.CancelKeyPress += cancelHandler;
             try
             {
-                RunCalibrationLoop(vr!, runOnce, dryRun, cts.Token);
+                RunCalibrationLoop(vr!, runOnce, dryRun, feetBackMeters, cts.Token);
             }
             finally
             {
@@ -146,7 +163,7 @@ internal static class Program
         return true;
     }
 
-    private static void RunCalibrationLoop(OpenVrReader vr, bool runOnce, bool dryRun, CancellationToken ct)
+    private static void RunCalibrationLoop(OpenVrReader vr, bool runOnce, bool dryRun, float feetBackMeters, CancellationToken ct)
     {
         Console.WriteLine("\n[Ready] How to sync at any time in VR:");
         Console.WriteLine("  1. Stand comfortably & look straight ahead for 1 second (1st beep = Armed).");
@@ -189,6 +206,13 @@ internal static class Program
         int lastDeviceCountLog = -1;
         int nextSleepMs = 0;
 
+        void ResetStill()
+        {
+            stillTimer = 0f;
+            stillSampleCount = 0;
+            stillJitterFrames = 0;
+        }
+
         while (!ct.IsCancellationRequested)
         {
             if (nextSleepMs > 0 && ct.WaitHandle.WaitOne(nextSleepMs))
@@ -198,9 +222,7 @@ internal static class Program
             if (DateTime.UtcNow < cooldownUntil)
             {
                 hasPrev = false;
-                stillTimer = 0f;
-                stillSampleCount = 0;
-                stillJitterFrames = 0;
+                ResetStill();
                 isArmed = false;
                 nextSleepMs = IdleSleepMs;
                 continue;
@@ -222,13 +244,13 @@ internal static class Program
 
                 if (lastDeviceCountLog != frame.ConnectedTrackerCount)
                 {
-                    Console.WriteLine($"[Waiting] Found HMD={frame.HasConnectedHmd}, Ultimate Trackers={frame.ConnectedTrackerCount}/3...");
+                    Console.WriteLine(frame.ConnectedTrackerCount > 3
+                        ? $"[Waiting] {frame.ConnectedTrackerCount} Ultimate Trackers connected, but QuestUTSync needs exactly 3 (waist + both feet). Turn the extra trackers off."
+                        : $"[Waiting] Found HMD={frame.HasConnectedHmd}, Ultimate Trackers={frame.ConnectedTrackerCount}/3...");
                     lastDeviceCountLog = frame.ConnectedTrackerCount;
                 }
                 hasPrev = false;
-                stillTimer = 0f;
-                stillSampleCount = 0;
-                stillJitterFrames = 0;
+                ResetStill();
                 isArmed = false;
                 nextSleepMs = IdleSleepMs;
                 continue;
@@ -305,8 +327,7 @@ internal static class Program
 
                         if (!LegLiftSolver.TryClassifyStandingTrackers(baseline.TrackerPos, out waistIdx, out footAIdx, out footBIdx))
                         {
-                            stillTimer = 0f;
-                            stillSampleCount = 0;
+                            ResetStill();
                             continue;
                         }
 
@@ -318,11 +339,9 @@ internal static class Program
 
                         isArmed = true;
                         armedTimer = 0f;
-                        stillTimer = 0f;
-                        stillSampleCount = 0;
-                        stillJitterFrames = 0;
+                        ResetStill();
                         Console.ForegroundColor = ConsoleColor.Cyan;
-                        Console.WriteLine("[Armed] Standing baseline locked! Lift your LEFT leg up (>10 cm) now...");
+                        Console.WriteLine("[Armed] Standing baseline locked! Lift your LEFT leg up (>10 cm) now (lifting the right one flips the result 180 deg)...");
                         Console.ResetColor();
                         TryBeepAsync(660, 120);
                     }
@@ -338,9 +357,7 @@ internal static class Program
 
                     if (!mildJitter)
                     {
-                        stillTimer = 0f;
-                        stillSampleCount = 0;
-                        stillJitterFrames = 0;
+                        ResetStill();
                     }
                 }
             }
@@ -408,7 +425,8 @@ internal static class Program
                         baseline.HmdForwardFlat,
                         baseline.TrackerPos[baseline.WaistIdx],
                         baseline.TrackerPos[liftedIdx],
-                        baseline.TrackerPos[plantedIdx]);
+                        baseline.TrackerPos[plantedIdx],
+                        feetBackMeters);
 
                     var newCal = LegLiftSolver.ComposeCalibration(currentCal, delta);
 
@@ -423,7 +441,13 @@ internal static class Program
                             frame.TrackerDevicePaths[liftedIdx],
                             frame.TrackerDevicePaths[plantedIdx]);
 
-                        if (VivePipeClient.TrySendCalibration(PipeName, newCal, out string pipeMsg))
+                        if (!VivePipeClient.TrySendCalibration(PipeName, newCal, out bool acked, out string pipeMsg))
+                        {
+                            Console.ForegroundColor = ConsoleColor.Red;
+                            Console.WriteLine($"[Pipe Warning] {pipeMsg}");
+                            Console.ResetColor();
+                        }
+                        else if (acked)
                         {
                             lastSentCal = newCal;
                             lastCalFileUtc = File.Exists(DefaultViveCalibPath)
@@ -437,9 +461,12 @@ internal static class Program
                         }
                         else
                         {
-                            Console.ForegroundColor = ConsoleColor.Red;
-                            Console.WriteLine($"[Pipe Warning] {pipeMsg}");
+                            // Not confirmed applied: never compose the next sync on top of it, re-read Calibration.json instead.
+                            lastSentCal = null;
+                            Console.ForegroundColor = ConsoleColor.Yellow;
+                            Console.WriteLine($"[Unconfirmed] {pipeMsg}");
                             Console.ResetColor();
+                            TryBeepAsync(440, 350);
                         }
                     }
 
@@ -486,10 +513,11 @@ internal static class Program
         Console.WriteLine("============================================================");
         Console.WriteLine("Usage: tracker_setup_lite.exe [options]\n");
         Console.WriteLine("Options:");
-        Console.WriteLine("  --once      Calibrate once and exit immediately");
-        Console.WriteLine("  --dry-run   Compute alignment without sending to VIVE Hub pipe");
-        Console.WriteLine("  --selftest  Run built-in verification math test suite");
-        Console.WriteLine("  --help, -h  Show this help screen\n");
+        Console.WriteLine("  --once              Calibrate once and exit immediately");
+        Console.WriteLine("  --dry-run           Compute alignment without sending to VIVE Hub pipe");
+        Console.WriteLine("  --feet-back-cm <n>  Place feet n cm behind the headset (default 0, range -30..30)");
+        Console.WriteLine("  --selftest          Run built-in verification math test suite");
+        Console.WriteLine("  --help, -h          Show this help screen\n");
         Console.WriteLine("In-VR Calibration Procedure:");
         Console.WriteLine("  1. Stand upright and look straight ahead for 1s (Single beep = Armed).");
         Console.WriteLine("  2. Lift your LEFT foot up 10+ cm (Double beep = Synced!).");
@@ -505,8 +533,9 @@ internal static class Program
         Vector3 hmdForward = new(MathF.Sin(hmdYaw), 0f, -MathF.Cos(hmdYaw));
         Vector3 hmdRight = new(-hmdForward.Z, 0f, hmdForward.X);
 
-        // In SteamVR Standing space (Y=0 floor), ankles sit at ~6% of HMD height above floor, directly under HMD XZ
-        Vector3 trueAnkleCenter = new(hmdPos.X, hmdPos.Y * 0.06f, hmdPos.Z);
+        // In SteamVR Standing space (Y=0 floor), ankles sit at ~6% of HMD height above floor, FeetBack metres behind the HMD
+        const float FeetBack = 0.08f;
+        Vector3 trueAnkleCenter = new Vector3(hmdPos.X, hmdPos.Y * 0.06f, hmdPos.Z) - hmdForward * FeetBack;
         Vector3 trueLeftFoot = trueAnkleCenter - hmdRight * 0.13f;
         Vector3 trueRightFoot = trueAnkleCenter + hmdRight * 0.13f;
         Vector3 trueWaist = trueAnkleCenter + new Vector3(0f, 0.85f, 0f);
@@ -536,7 +565,7 @@ internal static class Program
             throw new Exception("Waist must be classified as index 1 (highest Y)");
         }
 
-        var delta = LegLiftSolver.SolveDeltaTransform(hmdPos, hmdForward, steamVrWaist, steamVrLeft, steamVrRight);
+        var delta = LegLiftSolver.SolveDeltaTransform(hmdPos, hmdForward, steamVrWaist, steamVrLeft, steamVrRight, FeetBack);
         var composed = LegLiftSolver.ComposeCalibration(existingCal, delta);
 
         Vector3 solvedLeft = Vector3.Transform(rawLeft, composed.Rotation) + composed.Position;
@@ -636,7 +665,8 @@ internal static class LegLiftSolver
         Vector3 hmdForwardFlat,
         Vector3 waistPos,
         Vector3 leftFootStandingPos,
-        Vector3 rightFootStandingPos)
+        Vector3 rightFootStandingPos,
+        float feetBackMeters)
     {
         // 1. Vector from Right Foot to Left Foot in horizontal XZ plane
         float rlX = leftFootStandingPos.X - rightFootStandingPos.X;
@@ -659,7 +689,8 @@ internal static class LegLiftSolver
             currentAnkleMid.Y,
             0.5f * (currentAnkleMid.Z + waistPos.Z));
 
-        Vector3 targetBodyRef = new(hmdPos.X, hmdPos.Y * 0.06f, hmdPos.Z);
+        // ponytail: fixed anthropometric guess (ankles 6% of head height, feetBackMeters behind the HMD); tune per user via --feet-back-cm.
+        Vector3 targetBodyRef = new Vector3(hmdPos.X, hmdPos.Y * 0.06f, hmdPos.Z) - qstForward * feetBackMeters;
         Vector3 rotatedBodyRef = Vector3.Transform(currentBodyRef, deltaRot);
 
         Vector3 deltaTranslation = targetBodyRef - rotatedBodyRef;
@@ -762,7 +793,7 @@ internal static class VivePipeClient
         return buf;
     }
 
-    public static bool TrySendCalibration(string pipeName, CalibrationTransform cal, out string statusMessage)
+    public static bool TrySendCalibration(string pipeName, CalibrationTransform cal, out bool acked, out string statusMessage)
     {
         uint pid = (uint)Environment.ProcessId;
         uint tid = (uint)Environment.CurrentManagedThreadId;
@@ -785,7 +816,7 @@ internal static class VivePipeClient
                 pipe.WriteAsync(submitPkt).AsTask().GetAwaiter().GetResult();
                 pipe.FlushAsync().GetAwaiter().GetResult();
 
-                bool gotAck = false;
+                acked = false;
                 long deadline = Environment.TickCount64 + 300;
                 while (true)
                 {
@@ -798,14 +829,15 @@ internal static class VivePipeClient
                     if (bytesRead >= 8 &&
                         BinaryPrimitives.ReadUInt32LittleEndian(ackBuf.AsSpan(4, 4)) == CmdSubmitSpaceCalibrationTransform)
                     {
-                        gotAck = true;
+                        acked = true;
                         break;
                     }
                 }
 
-                statusMessage = gotAck
+                statusMessage = acked
                     ? "ViveTrackerServer ACKed 52-byte Submit_Space_Calibration_Transform (0x1F)."
-                    : "Sent 52-byte Submit_Space_Calibration_Transform (0x1F) to \\\\.\\pipe\\TrackerNamedPipe.";
+                    : "Sent 0x1F to ViveTrackerServer but got no acknowledgement; the calibration may not have been applied. " +
+                      "Check VIVE Hub is running and this program runs as tracker_setup_lite.exe.";
                 return true;
             }
             catch (Exception ex)
@@ -815,6 +847,7 @@ internal static class VivePipeClient
             }
         }
 
+        acked = false;
         statusMessage = $"Failed to send to \\\\.\\pipe\\{pipeName} ({lastErr?.Message}) — make sure VIVE Hub / ViveTrackerServer.exe is running.";
         return false;
     }
@@ -959,29 +992,28 @@ internal sealed unsafe class OpenVrReader : IDisposable
     {
         reader = null;
         int err = 0;
-        VR_InitInternal2(ref err, 3, null);
+        try
+        {
+            VR_InitInternal2(ref err, 3, null);
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
+        {
+            error = $"Could not load openvr_api.dll ({ex.Message})";
+            return false;
+        }
         if (err != 0)
         {
             error = $"VR_InitInternal2 returned EVRInitError={err}";
             return false;
         }
 
-        string[] versions = { "FnTable:IVRSystem_022", "FnTable:IVRSystem_021", "FnTable:IVRSystem_020" };
-        IntPtr fnTable = IntPtr.Zero;
-        foreach (string ver in versions)
-        {
-            err = 0;
-            fnTable = VR_GetGenericInterface(ver, ref err);
-            if (fnTable != IntPtr.Zero && err == 0)
-            {
-                break;
-            }
-        }
-
-        if (fnTable == IntPtr.Zero)
+        // Only IVRSystem_022: the function slots below (11, 19, 27) are verified for this version only.
+        err = 0;
+        IntPtr fnTable = VR_GetGenericInterface("FnTable:IVRSystem_022", ref err);
+        if (fnTable == IntPtr.Zero || err != 0)
         {
             VR_ShutdownInternal();
-            error = $"Failed to acquire IVRSystem FnTable (err={err})";
+            error = $"SteamVR does not provide IVRSystem_022 (err={err}). Update SteamVR.";
             return false;
         }
 
@@ -1106,7 +1138,7 @@ internal sealed unsafe class OpenVrReader : IDisposable
             }
 
             if (cached.IsHmd) snapshot.HasConnectedHmd = true;
-            else if (cached.IsUltimateTracker && snapshot.ConnectedTrackerCount < 3) snapshot.ConnectedTrackerCount++;
+            else if (cached.IsUltimateTracker) snapshot.ConnectedTrackerCount++;
 
             if (!pose.bPoseIsValid) continue;
 
@@ -1137,7 +1169,8 @@ internal sealed unsafe class OpenVrReader : IDisposable
             }
         }
 
-        return snapshot.HasHmd && snapshot.TrackerCount == 3;
+        // Exactly 3 connected: with extras, a dropped tracker could be silently replaced by another one mid-detection.
+        return snapshot.HasHmd && snapshot.TrackerCount == 3 && snapshot.ConnectedTrackerCount == 3;
     }
 
     private string GetStringProperty(uint deviceIdx, int prop)
