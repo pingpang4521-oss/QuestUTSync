@@ -1,15 +1,11 @@
 # Build output
-bin/
-obj/
+target/
 dist/
 
-# Visual Studio / Rider / VS Code
+# IDE
 .vs/
 .vscode/
-*.user
-*.suo
-*.userosv
-*.sln.docstates
+.idea/
 
 # Logs & temp files
 *.log

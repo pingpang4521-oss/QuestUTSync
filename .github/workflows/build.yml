@@ -17,18 +17,22 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup .NET
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: '8.0.x'
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
 
-    - name: Build and Publish
-      run: dotnet publish -c Release -o dist QuestUTSync.csproj
+    - name: Run Tests
+      run: cargo test -- --nocapture
 
-    - name: Copy Launcher Script and Third-Party Notice
+    - name: Build Release
+      run: cargo build --release
+
+    - name: Stage Distribution
       run: |
-        Copy-Item Run-QuestUTSync.bat dist\
+        New-Item -ItemType Directory -Force dist | Out-Null
+        Copy-Item target\release\tracker_setup_lite.exe dist\
+        Copy-Item lib\openvr_api.dll dist\
         Copy-Item lib\openvr_api.LICENSE.txt dist\
+        Copy-Item Run-QuestUTSync.bat dist\
 
     - name: Run Self-Test
       run: .\dist\tracker_setup_lite.exe --selftest
