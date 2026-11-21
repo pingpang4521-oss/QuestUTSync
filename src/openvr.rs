@@ -273,6 +273,8 @@ pub struct TrackerReading {
     pub pos: Vec3,
     pub linear_speed: f32,
     pub pose_valid: bool,
+    /// Set when this tracker is assigned to Left/Right Hand Sleeve (excluded from 3-tracker FBT sync).
+    pub hand_role: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -286,9 +288,10 @@ pub struct FrameSnapshot {
     pub hmd_angular_speed: f32,
     pub connected_tracker_count: usize,
     pub valid_tracker_count: usize,
+    pub excluded_hand_tracker_count: usize,
     pub max_tracker_linear_speed: f32,
     pub trackers: Vec<TrackerReading>,
-    /// Populated when exactly 3 Ultimate Trackers are connected & valid.
+    /// Populated when exactly 3 FBT Ultimate Trackers are connected & valid.
     pub solver_pos: [Vec3; 3],
     pub solver_serials: [String; 3],
     pub solver_paths: [String; 3],
@@ -490,7 +493,11 @@ impl OpenVrSession {
         }
     }
 
-    pub fn snapshot(&mut self) -> FrameSnapshot {
+    pub fn snapshot(
+        &mut self,
+        excluded_left_hand: Option<&str>,
+        excluded_right_hand: Option<&str>,
+    ) -> FrameSnapshot {
         let mut snap = FrameSnapshot::default();
         unsafe {
             (self.get_poses)(
@@ -569,7 +576,14 @@ impl OpenVrSession {
                     };
                 }
             } else if cached.is_ultimate_tracker {
-                snap.connected_tracker_count += 1;
+                let hand_role = if excluded_left_hand.is_some_and(|s| s.eq_ignore_ascii_case(&cached.serial)) {
+                    Some("L Hand")
+                } else if excluded_right_hand.is_some_and(|s| s.eq_ignore_ascii_case(&cached.serial)) {
+                    Some("R Hand")
+                } else {
+                    None
+                };
+
                 let m = pose.device_to_absolute.m;
                 let pos = Vec3::new(m[3], m[7], m[11]);
                 let speed = Vec3::from_array(pose.velocity.v).length();
@@ -578,8 +592,15 @@ impl OpenVrSession {
                     pos,
                     linear_speed: speed,
                     pose_valid: pose.pose_is_valid,
+                    hand_role,
                 });
 
+                if hand_role.is_some() {
+                    snap.excluded_hand_tracker_count += 1;
+                    continue;
+                }
+
+                snap.connected_tracker_count += 1;
                 if pose.pose_is_valid {
                     if snap.valid_tracker_count < 3 {
                         let k = snap.valid_tracker_count;
@@ -682,9 +703,15 @@ fn load_openvr_dll() -> Result<HMODULE, String> {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("openvr_api.dll"));
             candidates.push(dir.join("lib").join("openvr_api.dll"));
+            // Also find workspace `lib/` or `dist/` when launched directly from `target/release/`.
+            if let Some(ws) = dir.parent().and_then(|p| p.parent()) {
+                candidates.push(ws.join("lib").join("openvr_api.dll"));
+                candidates.push(ws.join("dist").join("openvr_api.dll"));
+            }
         }
     }
     candidates.push(PathBuf::from("lib").join("openvr_api.dll"));
+    candidates.push(PathBuf::from("dist").join("openvr_api.dll"));
     candidates.push(PathBuf::from("openvr_api.dll"));
 
     for path in &candidates {

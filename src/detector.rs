@@ -1,5 +1,7 @@
 use crate::openvr::{FrameSnapshot, OpenVrSession};
 use crate::pipe::{self, SendOutcome, PIPE_NAME};
+use crate::scanner::{RoomScanner, ScanSnapshot};
+use crate::sleeve_bridge::SleeveBridge;
 use crate::solver::{self, CalibrationTransform, DeltaTransform, StandingIndices};
 use glam::{Vec2, Vec3};
 use std::collections::{HashMap, VecDeque};
@@ -80,6 +82,9 @@ pub struct CalibrationEngine {
     pub latest_frame: FrameSnapshot,
     pub phase: DetectorPhase,
     pub assigned_roles: HashMap<String, &'static str>,
+    pub sleeve: SleeveBridge,
+    pub scanner: RoomScanner,
+    pub scan_snapshot: ScanSnapshot,
     pub active_cal: CalibrationTransform,
     pub editor_pos: [f32; 3],
     pub editor_ypr: [f32; 3],
@@ -116,11 +121,19 @@ pub struct CalibrationEngine {
 }
 
 impl CalibrationEngine {
-    pub fn new(dry_run: bool, feet_back_cm: f32, want_overlay: bool, echo_stdout: bool) -> Self {
+    pub fn new(
+        dry_run: bool,
+        feet_back_cm: f32,
+        want_overlay: bool,
+        echo_stdout: bool,
+        auto_launch_server: bool,
+    ) -> Self {
         let calib_path = pipe::default_vive_calib_path();
         let (initial_cal, warn) = pipe::read_current_calibration(&calib_path);
         let (y, p, r) = initial_cal.to_ypr_degrees();
         let now = Instant::now();
+        let scanner = RoomScanner::new(auto_launch_server, dry_run, true);
+        let scan_snapshot = scanner.snapshot();
 
         let mut engine = Self {
             vr: None,
@@ -132,6 +145,9 @@ impl CalibrationEngine {
             latest_frame: FrameSnapshot::default(),
             phase: DetectorPhase::Disconnected,
             assigned_roles: HashMap::new(),
+            sleeve: SleeveBridge::new(),
+            scanner,
+            scan_snapshot,
             active_cal: initial_cal,
             editor_pos: initial_cal.position.to_array(),
             editor_ypr: [y, p, r],
@@ -307,6 +323,13 @@ impl CalibrationEngine {
     pub fn tick(&mut self, allow_auto_reconnect: bool) -> bool {
         let now = Instant::now();
 
+        self.sleeve.poll();
+        self.scanner.sync_settings(self.audio_beeps);
+        for (level, msg) in self.scanner.drain_logs() {
+            self.log(level, msg);
+        }
+        self.scan_snapshot = self.scanner.snapshot();
+
         if self.vr.is_none() {
             self.phase = DetectorPhase::Disconnected;
             if allow_auto_reconnect && now.duration_since(self.last_reconnect_attempt) >= Duration::from_secs(2) {
@@ -320,7 +343,10 @@ impl CalibrationEngine {
             return false;
         }
 
-        let frame = self.vr.as_mut().unwrap().snapshot();
+        let frame = self.vr.as_mut().unwrap().snapshot(
+            self.sleeve.left_serial.as_deref(),
+            self.sleeve.right_serial.as_deref(),
+        );
         self.latest_frame = frame.clone();
 
         if !self.auto_sync {
@@ -359,7 +385,7 @@ impl CalibrationEngine {
             if self.last_device_count_log != cnt {
                 let msg = if frame.connected_tracker_count > 3 {
                     format!(
-                        "[Waiting] {} Ultimate Trackers connected, but QuestUTSync needs exactly 3 (waist + both feet). Turn the extra trackers off.",
+                        "[Waiting] {} FBT Ultimate Trackers active (need 3: waist + feet). Mark your Left/Right Hand Sleeve trackers with [L Hand]/[R Hand] to exclude them.",
                         frame.connected_tracker_count
                     )
                 } else {

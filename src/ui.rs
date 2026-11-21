@@ -1,5 +1,7 @@
 use crate::detector::{CalibrationEngine, DetectorPhase, LogLevel, SyncResultKind};
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
+use crate::pipe::MapState;
+use crate::scanner::{self, ScanPhase, ServerState};
+use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, RichText, Stroke, Vec2};
 
 const BG_DARK: Color32 = Color32::from_rgb(18, 21, 27);
 const BG_CARD: Color32 = Color32::from_rgb(26, 30, 39);
@@ -78,6 +80,37 @@ pub fn draw(
 
                 ui.add_space(6.0);
 
+                // VIVE Tracker Server pill
+                let snap = &engine.scan_snapshot;
+                let (srv_lbl, srv_bg, srv_fg) = match snap.server_state {
+                    ServerState::Running if snap.launched_standalone => (
+                        "Server: Standalone",
+                        Color32::from_rgb(16, 62, 48),
+                        ACCENT_GREEN,
+                    ),
+                    ServerState::Running => (
+                        "Server: Online",
+                        Color32::from_rgb(16, 62, 48),
+                        ACCENT_GREEN,
+                    ),
+                    ServerState::Launching | ServerState::Checking => (
+                        "Server: Starting...",
+                        Color32::from_rgb(72, 54, 16),
+                        ACCENT_AMBER,
+                    ),
+                    ServerState::Offline => (
+                        "Server: Offline",
+                        Color32::from_rgb(76, 26, 30),
+                        ACCENT_RED,
+                    ),
+                    ServerState::NotInstalled => (
+                        "Server: Missing",
+                        Color32::from_rgb(76, 26, 30),
+                        ACCENT_RED,
+                    ),
+                };
+                pill(ui, srv_lbl, srv_bg, srv_fg);
+
                 // SteamVR pill
                 let vr_ok = engine.vr.is_some();
                 pill(
@@ -105,8 +138,9 @@ pub fn draw(
                     );
                 }
 
-                // Tracker count pill
+                // Tracker count pill (FBT trackers + optional Hand Sleeve trackers)
                 let cnt = engine.latest_frame.connected_tracker_count;
+                let hand_cnt = engine.latest_frame.excluded_hand_tracker_count;
                 let (t_bg, t_fg) = if cnt == 3 && engine.latest_frame.valid_tracker_count == 3 {
                     (Color32::from_rgb(16, 62, 48), ACCENT_GREEN)
                 } else if cnt > 3 {
@@ -114,7 +148,15 @@ pub fn draw(
                 } else {
                     (Color32::from_rgb(72, 54, 16), ACCENT_AMBER)
                 };
-                pill(ui, &format!("Trackers: {cnt}/3"), t_bg, t_fg);
+                pill(ui, &format!("FBT: {cnt}/3"), t_bg, t_fg);
+                if hand_cnt > 0 {
+                    pill(
+                        ui,
+                        &format!("Hands: {hand_cnt}"),
+                        Color32::from_rgb(20, 56, 78),
+                        ACCENT_CYAN,
+                    );
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !vr_ok {
@@ -144,17 +186,27 @@ pub fn draw(
 
                 ui.add_space(10.0);
 
-                // 2. Main Hands-Free Leg-Lift Calibration Card
+                // 2. Standalone Server & Hands-Free Room Scan Card
+                draw_room_scan_card(ui, engine);
+
+                ui.add_space(10.0);
+
+                // 3. Main Hands-Free Leg-Lift Calibration Card
                 draw_calibration_card(ui, engine);
 
                 ui.add_space(10.0);
 
-                // 3. SpaceCalibrator-style Live Transform & Manual Offset Editor
+                // 3. Hand Sleeves + Switch Joy-Con (SleeveJoyConVR) Integration Card
+                draw_sleeve_card(ui, engine);
+
+                ui.add_space(10.0);
+
+                // 4. SpaceCalibrator-style Live Transform & Manual Offset Editor
                 draw_transform_editor(ui, engine);
 
                 ui.add_space(10.0);
 
-                // 4. Activity Log
+                // 5. Activity Log
                 draw_log_panel(ui, engine);
             });
         });
@@ -247,7 +299,7 @@ fn draw_reference_space(ui: &mut egui::Ui, engine: &CalibrationEngine) {
     });
 }
 
-fn draw_target_space(ui: &mut egui::Ui, engine: &CalibrationEngine) {
+fn draw_target_space(ui: &mut egui::Ui, engine: &mut CalibrationEngine) {
     card(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(
@@ -257,32 +309,33 @@ fn draw_target_space(ui: &mut egui::Ui, engine: &CalibrationEngine) {
                     .color(ACCENT_GREEN),
             );
             ui.label(
-                RichText::new("Vive Ultimate Trackers")
-                    .size(12.0)
+                RichText::new("Vive Ultimate Trackers (click L/R to mark Hand Sleeves)")
+                    .size(11.5)
                     .color(TEXT_MUTED),
             );
         });
         ui.separator();
 
-        let f = &engine.latest_frame;
         if engine.vr.is_none() {
             ui.label(RichText::new("Waiting for SteamVR connection...").color(TEXT_MUTED));
             return;
         }
 
-        if f.trackers.is_empty() {
+        let trackers = engine.latest_frame.trackers.clone();
+        let fbt_cnt = engine.latest_frame.connected_tracker_count;
+
+        if trackers.is_empty() {
             ui.label(
-                RichText::new("No Vive Ultimate Trackers detected. Turn on 3 trackers in VIVE Hub.")
+                RichText::new("No Vive Ultimate Trackers detected. Turn on trackers in VIVE Hub.")
                     .color(ACCENT_AMBER),
             );
             return;
         }
 
-        if f.connected_tracker_count > 3 {
+        if fbt_cnt > 3 {
             ui.label(
                 RichText::new(format!(
-                    "⚠ {} Ultimate Trackers connected — turn extra trackers off (need exactly 3).",
-                    f.connected_tracker_count
+                    "⚠ {fbt_cnt} FBT trackers active (need 3). Click [L] / [R] below on your Hand Sleeve trackers to exclude them."
                 ))
                 .size(12.0)
                 .color(ACCENT_RED),
@@ -290,19 +343,51 @@ fn draw_target_space(ui: &mut egui::Ui, engine: &CalibrationEngine) {
             ui.add_space(4.0);
         }
 
-        for trk in &f.trackers {
+        let mut pending_toggle: Option<(bool, String)> = None;
+
+        for trk in &trackers {
             let dot_col = if trk.pose_valid {
                 ACCENT_GREEN
             } else {
                 ACCENT_AMBER
             };
+            let is_l = trk.hand_role == Some("L Hand");
+            let is_r = trk.hand_role == Some("R Hand");
+
             ui.horizontal(|ui| {
                 ui.label(RichText::new("●").color(dot_col));
-                ui.label(RichText::new(&trk.serial).monospace().size(12.5));
-                if let Some(&role) = engine.assigned_roles.get(&trk.serial) {
+                ui.label(RichText::new(&trk.serial).monospace().size(12.0));
+                if let Some(hrole) = trk.hand_role {
+                    pill(ui, hrole, Color32::from_rgb(35, 42, 82), ACCENT_CYAN);
+                } else if let Some(&role) = engine.assigned_roles.get(&trk.serial) {
                     pill(ui, role, Color32::from_rgb(20, 62, 82), ACCENT_CYAN);
                 }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let r_btn = egui::Button::new(RichText::new("R").size(11.0).strong().color(
+                        if is_r { Color32::BLACK } else { TEXT_MUTED },
+                    ))
+                    .fill(if is_r { Color32::from_rgb(251, 113, 133) } else { BG_SUBTLE });
+                    if ui
+                        .add(r_btn)
+                        .on_hover_text("Assign as Right Hand Sleeve tracker (exclude from FBT)")
+                        .clicked()
+                    {
+                        pending_toggle = Some((false, trk.serial.clone()));
+                    }
+
+                    let l_btn = egui::Button::new(RichText::new("L").size(11.0).strong().color(
+                        if is_l { Color32::BLACK } else { TEXT_MUTED },
+                    ))
+                    .fill(if is_l { ACCENT_CYAN } else { BG_SUBTLE });
+                    if ui
+                        .add(l_btn)
+                        .on_hover_text("Assign as Left Hand Sleeve tracker (exclude from FBT)")
+                        .clicked()
+                    {
+                        pending_toggle = Some((true, trk.serial.clone()));
+                    }
+
                     if trk.pose_valid {
                         let still_col = if trk.linear_speed < 0.04 {
                             ACCENT_GREEN
@@ -312,22 +397,453 @@ fn draw_target_space(ui: &mut egui::Ui, engine: &CalibrationEngine) {
                         ui.label(
                             RichText::new(format!("{:.2} m/s", trk.linear_speed))
                                 .monospace()
-                                .size(11.5)
+                                .size(11.0)
                                 .color(still_col),
                         );
                         ui.label(
                             RichText::new(format!("Y {:.2}m", trk.pos.y))
                                 .monospace()
-                                .size(12.0)
+                                .size(11.5)
                                 .color(TEXT_MUTED),
                         );
                     } else {
-                        ui.label(RichText::new("No Pose").size(12.0).color(ACCENT_AMBER));
+                        ui.label(RichText::new("No Pose").size(11.5).color(ACCENT_AMBER));
                     }
                 });
             });
         }
+
+        if let Some((is_left, serial)) = pending_toggle {
+            match engine.sleeve.toggle_hand_serial(is_left, &serial) {
+                Ok(msg) => engine.log(LogLevel::Accent, format!("[Sleeve] {msg}")),
+                Err(e) => engine.log(LogLevel::Error, format!("[Sleeve] {e}")),
+            }
+        }
     });
+}
+
+fn draw_room_scan_card(ui: &mut egui::Ui, engine: &mut CalibrationEngine) {
+    let snap = engine.scan_snapshot.clone();
+    let scanning_or_busy = matches!(
+        snap.phase,
+        ScanPhase::Starting | ScanPhase::Scanning { .. } | ScanPhase::Finalizing { .. }
+    );
+
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Room Scan & Tracker Pairing")
+                    .strong()
+                    .size(15.0)
+                    .color(Color32::WHITE),
+            );
+
+            let (map_lbl, map_bg, map_fg) = match snap.server_state {
+                ServerState::NotInstalled => (
+                    "VIVE Runtime Not Found",
+                    Color32::from_rgb(76, 26, 30),
+                    ACCENT_RED,
+                ),
+                ServerState::Offline => (
+                    "Server Offline",
+                    Color32::from_rgb(76, 26, 30),
+                    ACCENT_RED,
+                ),
+                ServerState::Launching | ServerState::Checking => (
+                    "Starting Server...",
+                    Color32::from_rgb(72, 54, 16),
+                    ACCENT_AMBER,
+                ),
+                ServerState::Running => match snap.map_state {
+                    MapState::Ready => (
+                        "Map: Ready",
+                        Color32::from_rgb(16, 62, 48),
+                        ACCENT_GREEN,
+                    ),
+                    MapState::SetupRequired => (
+                        "Map: Scan Required",
+                        Color32::from_rgb(72, 54, 16),
+                        ACCENT_AMBER,
+                    ),
+                    MapState::NoTrackerConnected => (
+                        "No Tracker Connected",
+                        BG_SUBTLE,
+                        TEXT_MUTED,
+                    ),
+                    MapState::Unknown(_) => (
+                        "Map: Checking",
+                        BG_SUBTLE,
+                        TEXT_MUTED,
+                    ),
+                },
+            };
+            pill(ui, map_lbl, map_bg, map_fg);
+
+            if snap.server_state == ServerState::Running && snap.tracker_count > 0 {
+                pill(
+                    ui,
+                    &format!("Dongle: {} tracker(s)", snap.tracker_count),
+                    Color32::from_rgb(20, 56, 78),
+                    ACCENT_CYAN,
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if scanning_or_busy {
+                    let cancel_btn = egui::Button::new(
+                        RichText::new("Cancel Scan").strong().color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(110, 38, 46));
+                    if ui.add(cancel_btn).clicked() {
+                        engine.scanner.cancel_scan();
+                    }
+                    if matches!(snap.phase, ScanPhase::Scanning { .. }) {
+                        let fin_btn = egui::Button::new(
+                            RichText::new("Finish & Save Map").strong().color(Color32::BLACK),
+                        )
+                        .fill(ACCENT_GREEN);
+                        if ui.add(fin_btn).clicked() {
+                            engine.scanner.finish_scan();
+                        }
+                    }
+                } else {
+                    let needs_scan = snap.map_state == MapState::SetupRequired;
+                    let label = if needs_scan {
+                        "Scan Room Now"
+                    } else {
+                        "Scan Room"
+                    };
+                    let scan_btn = egui::Button::new(
+                        RichText::new(label)
+                            .strong()
+                            .color(if needs_scan { Color32::BLACK } else { Color32::WHITE }),
+                    )
+                    .fill(if needs_scan {
+                        ACCENT_CYAN
+                    } else {
+                        Color32::from_rgb(24, 78, 108)
+                    });
+                    if ui
+                        .add_enabled(snap.server_state != ServerState::NotInstalled, scan_btn)
+                        .on_hover_text(
+                            "Start a room scan directly via ViveTrackerServer (no HTC app or headset needed)",
+                        )
+                        .clicked()
+                    {
+                        engine.scanner.start_scan();
+                    }
+
+                    let pair_btn = egui::Button::new(
+                        RichText::new(if snap.pairing_busy {
+                            "Pairing..."
+                        } else {
+                            "Pair Tracker"
+                        })
+                        .strong()
+                        .color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(44, 58, 86));
+                    if ui
+                        .add_enabled(
+                            snap.server_state != ServerState::NotInstalled && !snap.pairing_busy,
+                            pair_btn,
+                        )
+                        .on_hover_text(
+                            "Auto-picks the next free dongle slot (1–5) and starts pairing mode. Hold tracker power button until LED blinks blue.",
+                        )
+                        .clicked()
+                    {
+                        engine.scanner.pair_tracker(None);
+                    }
+
+                    if snap.server_state == ServerState::Offline {
+                        if ui.button("Start Tracker Server").clicked() {
+                            engine.scanner.launch_server();
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+
+        match &snap.phase {
+            ScanPhase::Idle => {
+                let hint = match snap.server_state {
+                    ServerState::NotInstalled => {
+                        "Install VIVE Hub runtime so ViveTrackerServer.exe is available."
+                    }
+                    ServerState::Offline => {
+                        "ViveTrackerServer.exe is offline. Click 'Start Tracker Server' or 'Scan Room' to launch it silently."
+                    }
+                    ServerState::Launching | ServerState::Checking => {
+                        "Launching ViveTrackerServer.exe silently in standalone mode (no VIVE Hub UI)..."
+                    }
+                    ServerState::Running => match snap.map_state {
+                        MapState::SetupRequired => {
+                            "No room map on trackers yet. Click 'Scan Room Now', then slowly pan/turn 1 tracker 360° around your room — audio cues guide you hands-free."
+                        }
+                        MapState::NoTrackerConnected => {
+                            "Standalone tracker server is running. Turn on at least 1 VIVE Ultimate Tracker to scan or track."
+                        }
+                        MapState::Ready => {
+                            "Room map is active on your trackers (no HTC app needed). Click 'Scan Room' anytime if lighting or furniture changed."
+                        }
+                        MapState::Unknown(_) => "Connected to ViveTrackerServer.",
+                    },
+                };
+                ui.label(RichText::new(hint).size(12.0).color(TEXT_MUTED));
+            }
+            ScanPhase::Starting => {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(20, 38, 52))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .stroke(Stroke::new(1.0_f32, ACCENT_CYAN.linear_multiply(0.5)))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new("Initializing room scan on tracker...")
+                                .strong()
+                                .color(ACCENT_CYAN),
+                        );
+                    });
+            }
+            ScanPhase::Scanning {
+                elapsed_s,
+                host_serial,
+                coverage,
+                overall_pct,
+                low_light,
+                overspeed,
+            } => {
+                let target = engine.scanner.target_quality;
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(16, 42, 58))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(12, 10))
+                    .stroke(Stroke::new(1.0_f32, ACCENT_CYAN.linear_multiply(0.6)))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            draw_coverage_ring(ui, *coverage, *overall_pct, target);
+                            ui.add_space(10.0);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "SCANNING ROOM — {overall_pct}%  ({elapsed_s:.1}s)"
+                                    ))
+                                    .strong()
+                                    .size(15.0)
+                                    .color(if *overall_pct >= target {
+                                        ACCENT_GREEN
+                                    } else {
+                                        ACCENT_CYAN
+                                    }),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Host tracker: {host_serial}  •  Slowly pan 360° around your playspace (low & high walls)."
+                                    ))
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(220, 228, 240)),
+                                );
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::ProgressBar::new((*overall_pct as f32 / 100.0).clamp(0.0, 1.0))
+                                        .text(format!(
+                                            "Coverage: {overall_pct}% / Target {target}%"
+                                        ))
+                                        .fill(if *overall_pct >= target {
+                                            ACCENT_GREEN
+                                        } else {
+                                            ACCENT_CYAN
+                                        })
+                                        .desired_height(16.0),
+                                );
+                                if *overspeed || *low_light {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if *overspeed {
+                                            pill(
+                                                ui,
+                                                "⚠ Moving too fast — slow down",
+                                                Color32::from_rgb(76, 26, 30),
+                                                ACCENT_RED,
+                                            );
+                                        }
+                                        if *low_light {
+                                            pill(
+                                                ui,
+                                                "⚠ Low light — brighten room",
+                                                Color32::from_rgb(72, 54, 16),
+                                                ACCENT_AMBER,
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    });
+            }
+            ScanPhase::Finalizing { elapsed_s, note } => {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(16, 54, 52))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(12, 10))
+                    .stroke(Stroke::new(1.0_f32, ACCENT_GREEN.linear_multiply(0.5)))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(format!("Saving & Syncing Map... ({elapsed_s:.1}s)"))
+                                .strong()
+                                .size(14.5)
+                                .color(ACCENT_GREEN),
+                        );
+                        ui.label(
+                            RichText::new(note)
+                                .size(12.0)
+                                .color(Color32::from_rgb(220, 228, 240)),
+                        );
+                    });
+            }
+            ScanPhase::Completed { message } => {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(16, 62, 48))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .stroke(Stroke::new(1.0_f32, ACCENT_GREEN.linear_multiply(0.5)))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(message).strong().size(12.5).color(ACCENT_GREEN));
+                    });
+            }
+            ScanPhase::Error { message } => {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(76, 26, 30))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .stroke(Stroke::new(1.0_f32, ACCENT_RED.linear_multiply(0.5)))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(message).size(12.5).color(ACCENT_RED));
+                    });
+            }
+        }
+
+        if let Some(note) = &snap.pair_status {
+            ui.add_space(5.0);
+            ui.label(RichText::new(format!("Pairing: {note}")).size(12.0).color(ACCENT_CYAN));
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut engine.scanner.auto_finish, "Auto-Finish at Target");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Target Quality:").size(12.0).color(TEXT_MUTED));
+            let mut tq = engine.scanner.target_quality as i32;
+            if ui
+                .add(egui::Slider::new(&mut tq, 50..=90).suffix("%"))
+                .changed()
+            {
+                engine.scanner.target_quality = tq as u8;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_pair =
+                    snap.server_state != ServerState::NotInstalled && !snap.pairing_busy && !scanning_or_busy;
+                if ui
+                    .add_enabled(can_pair, egui::Button::new("Unpair").small())
+                    .on_hover_text("Unpair the selected dongle slot (1–5)")
+                    .clicked()
+                {
+                    engine.scanner.unpair_slot(engine.scanner.selected_slot);
+                }
+                if ui
+                    .add_enabled(can_pair, egui::Button::new("Pair Slot").small())
+                    .on_hover_text("Pair a tracker into the specific dongle slot (1–5)")
+                    .clicked()
+                {
+                    engine.scanner.pair_tracker(Some(engine.scanner.selected_slot));
+                }
+                for slot in (0..5u32).rev() {
+                    let selected = engine.scanner.selected_slot == slot;
+                    let occupied = snap
+                        .paired_trackers
+                        .iter()
+                        .any(|t| t.display_num == slot + 1);
+                    let btn = egui::Button::new(
+                        RichText::new(format!("{}", slot + 1))
+                            .size(11.0)
+                            .strong()
+                            .color(if selected {
+                                Color32::BLACK
+                            } else if occupied {
+                                ACCENT_GREEN
+                            } else {
+                                TEXT_MUTED
+                            }),
+                    )
+                    .fill(if selected { ACCENT_CYAN } else { BG_SUBTLE })
+                    .small();
+                    if ui
+                        .add(btn)
+                        .on_hover_text(if occupied {
+                            format!("Dongle Slot #{} (Paired)", slot + 1)
+                        } else {
+                            format!("Dongle Slot #{} (Free)", slot + 1)
+                        })
+                        .clicked()
+                    {
+                        engine.scanner.selected_slot = slot;
+                    }
+                }
+                ui.label(RichText::new("Dongle Slot:").size(12.0).color(TEXT_MUTED));
+            });
+        });
+    });
+}
+
+fn draw_coverage_ring(ui: &mut egui::Ui, coverage: [u8; 8], overall_pct: u8, target: u8) {
+    let size = Vec2::splat(76.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = 30.0_f32;
+    let step = std::f32::consts::TAU / 8.0;
+
+    for i in 0..8 {
+        let pct = scanner::normalize_sector_pct(coverage, i);
+        let col = if pct >= target {
+            ACCENT_GREEN
+        } else if pct >= 40 {
+            ACCENT_AMBER
+        } else if pct > 0 {
+            ACCENT_CYAN
+        } else {
+            Color32::from_rgb(48, 56, 72)
+        };
+        let a0 = -std::f32::consts::FRAC_PI_2 + (i as f32) * step + 0.08;
+        let a1 = a0 + step - 0.16;
+        let segs = 6;
+        let mut pts = Vec::with_capacity(segs + 1);
+        for s in 0..=segs {
+            let a = a0 + (a1 - a0) * (s as f32 / segs as f32);
+            pts.push(Pos2::new(center.x + radius * a.cos(), center.y + radius * a.sin()));
+        }
+        painter.add(egui::Shape::line(pts, Stroke::new(6.0_f32, col)));
+    }
+
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        format!("{overall_pct}%"),
+        egui::FontId::proportional(15.0),
+        if overall_pct >= target {
+            ACCENT_GREEN
+        } else {
+            Color32::WHITE
+        },
+    );
 }
 
 fn draw_calibration_card(ui: &mut egui::Ui, engine: &mut CalibrationEngine) {
@@ -487,6 +1003,112 @@ fn draw_calibration_card(ui: &mut egui::Ui, engine: &mut CalibrationEngine) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Reset Detector").clicked() {
                     engine.disarm();
+                }
+            });
+        });
+    });
+}
+
+fn draw_sleeve_card(ui: &mut egui::Ui, engine: &mut CalibrationEngine) {
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Hand Sleeves & Switch Joy-Cons")
+                    .strong()
+                    .size(14.0)
+                    .color(Color32::WHITE),
+            );
+            let (bg, fg, lbl) = if engine.sleeve.streaming {
+                (Color32::from_rgb(16, 62, 48), ACCENT_GREEN, "VR Bridge: Streaming")
+            } else if engine.sleeve.ui_running {
+                (Color32::from_rgb(20, 56, 78), ACCENT_CYAN, "UI Running (Paused)")
+            } else {
+                (BG_SUBTLE, TEXT_MUTED, "Bridge: Idle")
+            };
+            pill(ui, lbl, bg, fg);
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Open Full Button/Offset UI").clicked() {
+                    match engine.sleeve.open_sleeve_ui() {
+                        Ok(msg) => engine.log(LogLevel::Accent, format!("[Sleeve] {msg}")),
+                        Err(e) => engine.log(LogLevel::Error, format!("[Sleeve] {e}")),
+                    }
+                }
+                let next_stream = !engine.sleeve.streaming;
+                let stream_btn = egui::Button::new(
+                    RichText::new(if next_stream {
+                        "Start VR Hand Bridge"
+                    } else {
+                        "Stop VR Hand Bridge"
+                    })
+                    .strong()
+                    .color(if next_stream { Color32::BLACK } else { Color32::WHITE }),
+                )
+                .fill(if next_stream {
+                    ACCENT_GREEN
+                } else {
+                    Color32::from_rgb(110, 38, 46)
+                });
+                if ui.add(stream_btn).clicked() {
+                    match engine.sleeve.set_streaming(next_stream) {
+                        Ok(msg) => engine.log(LogLevel::Success, format!("[Sleeve] {msg}")),
+                        Err(e) => engine.log(LogLevel::Error, format!("[Sleeve] {e}")),
+                    }
+                }
+            });
+        });
+
+        ui.separator();
+
+        ui.columns(2, |cols| {
+            let l_ser = engine
+                .sleeve
+                .left_serial
+                .as_deref()
+                .unwrap_or("Auto (mark [L] above)");
+            cols[0].horizontal(|ui| {
+                ui.label(RichText::new("Left Sleeve:").color(ACCENT_CYAN).strong().size(12.5));
+                ui.monospace(l_ser);
+            });
+            cols[0].horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("L1={}  •  L2={}", engine.sleeve.l1, engine.sleeve.l2))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+                if ui.small_button("Swap L1 ↔ L2").clicked() {
+                    match engine.sleeve.swap_shoulders(true) {
+                        Ok(msg) => engine.log(LogLevel::Info, format!("[Sleeve] {msg}")),
+                        Err(e) => engine.log(LogLevel::Error, format!("[Sleeve] {e}")),
+                    }
+                }
+            });
+
+            let r_ser = engine
+                .sleeve
+                .right_serial
+                .as_deref()
+                .unwrap_or("Auto (mark [R] above)");
+            cols[1].horizontal(|ui| {
+                ui.label(
+                    RichText::new("Right Sleeve:")
+                        .color(Color32::from_rgb(251, 113, 133))
+                        .strong()
+                        .size(12.5),
+                );
+                ui.monospace(r_ser);
+            });
+            cols[1].horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("R1={}  •  R2={}", engine.sleeve.r1, engine.sleeve.r2))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+                if ui.small_button("Swap R1 ↔ R2").clicked() {
+                    match engine.sleeve.swap_shoulders(false) {
+                        Ok(msg) => engine.log(LogLevel::Info, format!("[Sleeve] {msg}")),
+                        Err(e) => engine.log(LogLevel::Error, format!("[Sleeve] {e}")),
+                    }
                 }
             });
         });

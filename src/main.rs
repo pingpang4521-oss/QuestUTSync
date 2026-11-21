@@ -2,21 +2,27 @@ mod detector;
 mod openvr;
 mod overlay;
 mod pipe;
+mod scanner;
+mod sleeve_bridge;
 mod solver;
 mod ui;
 
 use detector::{CalibrationEngine, LogLevel};
 use eframe::egui;
 use overlay::DashboardOverlay;
+use scanner::{RoomScanner, ScanPhase, ServerState};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct CliOptions {
     show_help: bool,
     self_test: bool,
     headless: bool,
     run_once: bool,
+    scan_room: bool,
+    pair_tracker: bool,
+    no_autolaunch: bool,
     dry_run: bool,
     feet_back_cm: f32,
 }
@@ -27,6 +33,9 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         self_test: false,
         headless: false,
         run_once: false,
+        scan_room: false,
+        pair_tracker: false,
+        no_autolaunch: false,
         dry_run: false,
         feet_back_cm: 0.0,
     };
@@ -44,6 +53,9 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
                 opts.run_once = true;
                 opts.headless = true;
             }
+            "--scan" => opts.scan_room = true,
+            "--pair" => opts.pair_tracker = true,
+            "--no-autolaunch" => opts.no_autolaunch = true,
             "--dry-run" => opts.dry_run = true,
             "--feet-back-cm" => {
                 let Some(val_str) = args.get(i + 1) else {
@@ -75,6 +87,9 @@ fn print_help() {
     println!("============================================================");
     println!("Usage: tracker_setup_lite.exe [options]\n");
     println!("Options:");
+    println!("  --scan              Run a hands-free room scan (no HTC app/headset) and exit");
+    println!("  --pair              Put the next free dongle slot into pairing mode and exit");
+    println!("  --no-autolaunch     Do not auto-launch ViveTrackerServer.exe silently");
     println!("  --headless          Run in console mode without GUI/overlay");
     println!("  --once              Calibrate once (headless) and exit immediately");
     println!("  --dry-run           Compute alignment without sending to VIVE Hub pipe");
@@ -174,6 +189,118 @@ fn stage_alias_executable(exe: &std::path::Path) -> Result<PathBuf, std::io::Err
     Ok(staged_exe)
 }
 
+fn run_cli_pair(opts: &CliOptions) -> ExitCode {
+    println!("============================================================");
+    println!(" QuestUTSync - Dongle Tracker Pairing (No HTC App Required)");
+    println!("============================================================");
+    let scanner = RoomScanner::new(!opts.no_autolaunch, opts.dry_run, true);
+    let start_wait = Instant::now();
+    loop {
+        for (_, msg) in scanner.drain_logs() {
+            println!("{msg}");
+        }
+        let snap = scanner.snapshot();
+        match snap.server_state {
+            ServerState::Running => break,
+            ServerState::NotInstalled => {
+                eprintln!("[Error] ViveTrackerServer.exe not found.");
+                return ExitCode::from(1);
+            }
+            ServerState::Offline if start_wait.elapsed() >= Duration::from_secs(14) => {
+                eprintln!("[Error] ViveTrackerServer.exe did not start within 14s.");
+                return ExitCode::from(1);
+            }
+            _ => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+
+    scanner.pair_tracker(None);
+    let wait = Instant::now();
+    while wait.elapsed() < Duration::from_secs(6) {
+        let logs = scanner.drain_logs();
+        let mut done = false;
+        let mut ok = true;
+        for (lvl, msg) in logs {
+            println!("{msg}");
+            if msg.starts_with("[Pair]") {
+                done = true;
+                if lvl == LogLevel::Error {
+                    ok = false;
+                }
+            }
+        }
+        if done {
+            return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("[Error] Timed out waiting for pairing response.");
+    ExitCode::from(1)
+}
+
+fn run_cli_scan(opts: &CliOptions) -> ExitCode {
+    println!("============================================================");
+    println!(" QuestUTSync - Hands-Free Room Scan (No HTC App Required)");
+    println!("============================================================");
+    let scanner = RoomScanner::new(!opts.no_autolaunch, opts.dry_run, true);
+
+    // Wait up to 8s for standalone ViveTrackerServer.exe to come online
+    let start_wait = Instant::now();
+    loop {
+        for (_, msg) in scanner.drain_logs() {
+            println!("{msg}");
+        }
+        let snap = scanner.snapshot();
+        match snap.server_state {
+            ServerState::Running => break,
+            ServerState::NotInstalled => {
+                eprintln!("[Error] ViveTrackerServer.exe not found.");
+                return ExitCode::from(1);
+            }
+            ServerState::Offline if start_wait.elapsed() >= Duration::from_secs(14) => {
+                eprintln!("[Error] ViveTrackerServer.exe did not start within 14s.");
+                return ExitCode::from(1);
+            }
+            _ => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+
+    scanner.start_scan();
+    let mut last_pct: Option<u8> = None;
+
+    loop {
+        for (_, msg) in scanner.drain_logs() {
+            println!("{msg}");
+        }
+        let snap = scanner.snapshot();
+        match snap.phase {
+            ScanPhase::Scanning {
+                elapsed_s,
+                overall_pct,
+                low_light,
+                overspeed,
+                ..
+            } => {
+                if last_pct != Some(overall_pct) {
+                    last_pct = Some(overall_pct);
+                    let mut flags = String::new();
+                    if overspeed {
+                        flags.push_str(" [TOO FAST]");
+                    }
+                    if low_light {
+                        flags.push_str(" [LOW LIGHT]");
+                    }
+                    println!("[Scanning] Coverage: {overall_pct}% ({elapsed_s:.1}s){flags}");
+                }
+            }
+            ScanPhase::Completed { .. } => return ExitCode::SUCCESS,
+            ScanPhase::Error { .. } => return ExitCode::from(1),
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 fn run_headless(opts: &CliOptions) -> ExitCode {
     println!("============================================================");
     println!(" QuestUTSync - Automatic Vive Ultimate Tracker Calibration");
@@ -182,7 +309,13 @@ fn run_headless(opts: &CliOptions) -> ExitCode {
         println!("[Config] Feet placed {:.1} cm behind the headset.", opts.feet_back_cm);
     }
 
-    let mut engine = CalibrationEngine::new(opts.dry_run, opts.feet_back_cm, false, true);
+    let mut engine = CalibrationEngine::new(
+        opts.dry_run,
+        opts.feet_back_cm,
+        false,
+        true,
+        !opts.no_autolaunch,
+    );
     if !engine.try_connect_vr(false) {
         eprintln!("Make sure SteamVR is running, then launch QuestUTSync again.");
         return ExitCode::from(1);
@@ -219,7 +352,13 @@ struct QuestUTSyncApp {
 impl QuestUTSyncApp {
     fn new(cc: &eframe::CreationContext<'_>, opts: &CliOptions) -> Self {
         ui::apply_style(&cc.egui_ctx);
-        let mut engine = CalibrationEngine::new(opts.dry_run, opts.feet_back_cm, true, false);
+        let mut engine = CalibrationEngine::new(
+            opts.dry_run,
+            opts.feet_back_cm,
+            true,
+            false,
+            !opts.no_autolaunch,
+        );
         engine.try_connect_vr(false);
         let mut app = Self {
             engine,
@@ -296,10 +435,14 @@ impl eframe::App for QuestUTSyncApp {
             self.overlay = Some(ov);
         }
 
-        // Keep polling at 60 Hz when VR overlay is visible, 30 Hz when tracking, 5 Hz when idle/disconnected.
+        // Keep polling at 60 Hz when VR overlay is visible, 30 Hz when tracking or scanning, 5 Hz when idle.
+        let scanning_active = matches!(
+            self.engine.scan_snapshot.phase,
+            ScanPhase::Starting | ScanPhase::Scanning { .. } | ScanPhase::Finalizing { .. }
+        );
         let interval_ms = if overlay_visible {
             16
-        } else if self.engine.latest_frame.ready_for_solver() {
+        } else if self.engine.latest_frame.ready_for_solver() || scanning_active {
             33
         } else {
             200
@@ -344,6 +487,14 @@ fn main() -> ExitCode {
         if let Some(code) = try_relaunch_with_allowed_pipe_name(&raw_args) {
             return code;
         }
+    }
+
+    if opts.pair_tracker {
+        return run_cli_pair(&opts);
+    }
+
+    if opts.scan_room {
+        return run_cli_scan(&opts);
     }
 
     if opts.headless {

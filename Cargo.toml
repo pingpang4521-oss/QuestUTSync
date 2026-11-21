@@ -1,9 +1,9 @@
 [package]
 name = "questutsync"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["pingpang4521-oss"]
-description = "Automatic Vive Ultimate Tracker to Meta Quest playspace synchronizer for SteamVR"
+description = "Standalone Vive Ultimate Tracker manager & hands-free Meta Quest playspace synchronizer (silent backend, room scan, dongle pairing, SteamVR overlay)"
 license = "MIT"
 repository = "https://github.com/pingpang4521-oss/QuestUTSync"
 
